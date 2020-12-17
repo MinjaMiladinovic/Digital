@@ -1,660 +1,710 @@
 /*
- * Copyright (c) 2018 Helmut Neemann.
+ * Copyright (c) 2016 Helmut Neemann
  * Use of this source code is governed by the GPL v3 license
  * that can be found in the LICENSE file.
  */
-package de.neemann.digital.hdl.hgs;
+package de.neemann.digital.draw.library;
 
-import de.neemann.digital.core.Bits;
-import de.neemann.digital.hdl.hgs.function.FirstClassFunction;
-import de.neemann.digital.hdl.hgs.function.FirstClassFunctionCall;
-import de.neemann.digital.hdl.hgs.refs.*;
+import de.neemann.digital.core.arithmetic.*;
+import de.neemann.digital.core.arithmetic.Comparator;
+import de.neemann.digital.core.basic.*;
+import de.neemann.digital.core.element.ElementAttributes;
+import de.neemann.digital.core.element.ElementTypeDescription;
+import de.neemann.digital.core.element.Keys;
+import de.neemann.digital.core.extern.External;
+import de.neemann.digital.core.flipflops.*;
+import de.neemann.digital.core.io.*;
+import de.neemann.digital.core.memory.*;
+import de.neemann.digital.core.pld.DiodeBackward;
+import de.neemann.digital.core.pld.DiodeForward;
+import de.neemann.digital.core.pld.PullDown;
+import de.neemann.digital.core.pld.PullUp;
+import de.neemann.digital.core.switching.*;
+import de.neemann.digital.core.wiring.*;
+import de.neemann.digital.draw.elements.Circuit;
+import de.neemann.digital.draw.elements.PinException;
+import de.neemann.digital.draw.elements.Tunnel;
+import de.neemann.digital.draw.shapes.ShapeFactory;
+import de.neemann.digital.gui.Settings;
+import de.neemann.digital.gui.components.data.DummyElement;
+import de.neemann.digital.gui.components.data.ScopeTrigger;
+import de.neemann.digital.gui.components.graphics.GraphicCard;
+import de.neemann.digital.gui.components.graphics.LedMatrix;
+import de.neemann.digital.gui.components.graphics.VGA;
+import de.neemann.digital.gui.components.terminal.Keyboard;
+import de.neemann.digital.gui.components.terminal.Terminal;
+import de.neemann.digital.lang.Lang;
+import de.neemann.digital.testing.TestCaseElement;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import java.io.*;
-import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.Map;
-
-import static de.neemann.digital.hdl.hgs.Tokenizer.Token.*;
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.net.URISyntaxException;
+import java.util.*;
 
 /**
- * Parser to evaluate text templates
+ * The ElementLibrary is responsible for storing all the components which can be used in a circuit.
+ * Also the import of nested circuits is handled in this class.
+ * This import works in two steps: At first all the files in the same directory as the root circuit are loaded.
+ * The file names are shown in the components menu. From there you can pick a file to insert it to the circuit.
+ * When a file is selected it is loaded to the library. After that also an icon is available.
+ * This is done because the loading of a circuit and the creation of an icon is very time consuming and should
+ * be avoided if not necessary. It's a kind of lazy loading.
  */
-public class Parser {
+public class ElementLibrary implements Iterable<ElementLibrary.ElementContainer>, LibraryInterface {
+    private static final Logger LOGGER = LoggerFactory.getLogger(ElementLibrary.class);
+    private static final long MIN_RESCAN_INTERVAL = 5000;
 
     /**
-     * Creates a statement from the jar file using ClassLoader.getSystemResourceAsStream(path).
-     *
-     * @param path the path of the file to load
-     * @param cl   the classloader used to load the template. If set to null, the SystemClassLoader is used
-     * @return the statement
-     * @throws IOException     IOException
-     * @throws ParserException ParserException
+     * @return the additional library path
      */
-    public static Statement createFromJar(String path, ClassLoader cl) throws IOException, ParserException {
-        if (cl == null)
-            cl = ClassLoader.getSystemClassLoader();
-        InputStream in = cl.getResourceAsStream(path);
-        if (in == null)
-            throw new FileNotFoundException("file not found: " + path);
-        try (Reader r = new InputStreamReader(in, StandardCharsets.UTF_8)) {
-            Parser p = new Parser(r, path);
-            return p.parse();
-        }
-    }
-
-    /**
-     * Creates a statement from the jar file using ClassLoader.getSystemResourceAsStream(path).
-     * Throws only a RuntimeExcaption so use with care!
-     *
-     * @param path the path of the file to load
-     * @return the statement
-     */
-    public static Statement createFromJarStatic(String path) {
+    public static File getLibPath() {
+        String path;
         try {
-            return createFromJar(path, null);
-        } catch (IOException | ParserException e) {
-            throw new RuntimeException("could not parse: " + path, e);
+            path = ElementLibrary.class.getProtectionDomain().getCodeSource().getLocation().toURI().getPath().replace('\\', '/');
+        } catch (URISyntaxException e) {
+            return new File("noLibFound");
+        }
+        if (path.endsWith("/target/classes/"))
+            return toCanonical(new File(path.substring(0, path.length() - 16) + "/src/main/dig/lib"));
+        if (path.endsWith("/target/Digital.jar"))
+            return new File(path.substring(0, path.length() - 19) + "/src/main/dig/lib");
+        if (path.endsWith("Digital.jar"))
+            return new File(path.substring(0, path.length() - 12) + "/lib");
+
+        return new File("noLibFound");
+    }
+
+    private static File toCanonical(File file) {
+        try {
+            return file.getCanonicalFile();
+        } catch (IOException e) {
+            return file;
         }
     }
 
-
-    private ArrayList<Reference> refRead;
-    private final Tokenizer tok;
+    private final HashMap<String, LibraryNode> map = new HashMap<>();
+    private final HashSet<String> isProgrammable = new HashSet<>();
+    private final ArrayList<LibraryListener> listeners = new ArrayList<>();
+    private final LibraryNode root;
+    private JarComponentManager jarComponentManager;
+    private ShapeFactory shapeFactory;
+    private ElementLibraryFolder custom;
+    private File rootLibraryPath;
+    private Exception exception;
+    private long lastRescanTime;
+    private StringBuilder warningMessage;
 
     /**
-     * Create a new instance
+     * Creates a new instance.
+     */
+    public ElementLibrary() {
+        this(null);
+    }
+
+    /**
+     * Creates a new instance.
      *
-     * @param code the code to parse
+     * @param jarFile the jar file to load
      */
-    public Parser(String code) {
-        this(new StringReader(code), "");
+    public ElementLibrary(File jarFile) {
+        root = new LibraryNode(Lang.get("menu_elements"))
+                .setLibrary(this)
+                .add(new LibraryNode(Lang.get("lib_Logic"))
+                        .add(And.DESCRIPTION)
+                        .add(NAnd.DESCRIPTION)
+                        .add(Or.DESCRIPTION)
+                        .add(NOr.DESCRIPTION)
+                        .add(XOr.DESCRIPTION)
+                        .add(XNOr.DESCRIPTION)
+                        .add(Not.DESCRIPTION)
+                        .add(LookUpTable.DESCRIPTION))
+                .add(new LibraryNode(Lang.get("lib_io"))
+                        .add(Out.DESCRIPTION)
+                        .add(Out.LEDDESCRIPTION)
+                        .add(In.DESCRIPTION)
+                        .add(Clock.DESCRIPTION)
+                        .add(Button.DESCRIPTION)
+                        .add(DipSwitch.DESCRIPTION)
+                        .add(DummyElement.TEXTDESCRIPTION)
+                        .add(Probe.DESCRIPTION)
+                        .add(DummyElement.DATADESCRIPTION)
+                        .add(ScopeTrigger.DESCRIPTION)
+                        .add(new LibraryNode(Lang.get("lib_displays"))
+                                .add(RGBLED.DESCRIPTION)
+                                .add(Out.POLARITYAWARELEDDESCRIPTION)
+                                .add(ButtonLED.DESCRIPTION)
+                                .add(Out.SEVENDESCRIPTION)
+                                .add(Out.SEVENHEXDESCRIPTION)
+                                .add(Out.SIXTEENDESCRIPTION)
+                                .add(LightBulb.DESCRIPTION)
+                                .add(LedMatrix.DESCRIPTION)
+                        )
+                        .add(new LibraryNode(Lang.get("lib_mechanic"))
+                                .add(RotEncoder.DESCRIPTION)
+                                .add(StepperMotorUnipolar.DESCRIPTION)
+                                .add(StepperMotorBipolar.DESCRIPTION)
+                        )
+                        .add(new LibraryNode(Lang.get("lib_peripherals"))
+                                .add(Keyboard.DESCRIPTION)
+                                .add(Terminal.DESCRIPTION)
+                                .add(VGA.DESCRIPTION)
+                                .add(MIDI.DESCRIPTION)
+                        )
+                )
+                .add(new LibraryNode(Lang.get("lib_wires"))
+                        .add(Ground.DESCRIPTION)
+                        .add(VDD.DESCRIPTION)
+                        .add(Const.DESCRIPTION)
+                        .add(Tunnel.DESCRIPTION)
+                        .add(Splitter.DESCRIPTION)
+                        .add(Driver.DESCRIPTION)
+                        .add(DriverInvSel.DESCRIPTION)
+                        .add(Delay.DESCRIPTION)
+                        .add(PullUp.DESCRIPTION)
+                        .add(PullDown.DESCRIPTION)
+                        .add(NotConnected.DESCRIPTION))
+                .add(new LibraryNode(Lang.get("lib_mux"))
+                        .add(Multiplexer.DESCRIPTION)
+                        .add(Demultiplexer.DESCRIPTION)
+                        .add(Decoder.DESCRIPTION)
+                        .add(BitSelector.DESCRIPTION)
+                        .add(PriorityEncoder.DESCRIPTION))
+                .add(new LibraryNode(Lang.get("lib_flipFlops"))
+                        .add(FlipflopRSAsync.DESCRIPTION)
+                        .add(FlipflopRS.DESCRIPTION)
+                        .add(FlipflopJK.DESCRIPTION)
+                        .add(FlipflopD.DESCRIPTION)
+                        .add(FlipflopT.DESCRIPTION)
+                        .add(FlipflopJKAsync.DESCRIPTION)
+                        .add(FlipflopDAsync.DESCRIPTION)
+                        .add(Monoflop.DESCRIPTION))
+                .add(new LibraryNode(Lang.get("lib_memory"))
+                        .add(new LibraryNode(Lang.get("lib_ram"))
+                                .add(RAMDualPort.DESCRIPTION)
+                                .add(BlockRAMDualPort.DESCRIPTION)
+                                .add(RAMSinglePort.DESCRIPTION)
+                                .add(RAMSinglePortSel.DESCRIPTION)
+                                .add(RegisterFile.DESCRIPTION)
+                                .add(RAMDualAccess.DESCRIPTION)
+                                .add(GraphicCard.DESCRIPTION))
+                        .add(new LibraryNode(Lang.get("lib_eeprom"))
+                                .add(EEPROM.DESCRIPTION)
+                                .add(EEPROMDualPort.DESCRIPTION))
+                        .add(Register.DESCRIPTION)
+                        .add(ROM.DESCRIPTION)
+                        .add(ROMDualPort.DESCRIPTION)
+                        .add(Counter.DESCRIPTION)
+                        .add(CounterPreset.DESCRIPTION))
+                .add(new LibraryNode(Lang.get("lib_arithmetic"))
+                        .add(Add.DESCRIPTION)
+                        .add(Sub.DESCRIPTION)
+                        .add(Mul.DESCRIPTION)
+                        .add(Div.DESCRIPTION)
+                        .add(BarrelShifter.DESCRIPTION)
+                        .add(Comparator.DESCRIPTION)
+                        .add(Neg.DESCRIPTION)
+                        .add(BitExtender.DESCRIPTION)
+                        .add(BitCount.DESCRIPTION))
+                .add(new LibraryNode(Lang.get("lib_switching"))
+                        .add(Switch.DESCRIPTION)
+                        .add(SwitchDT.DESCRIPTION)
+                        .add(Relay.DESCRIPTION)
+                        .add(RelayDT.DESCRIPTION)
+                        .add(PFET.DESCRIPTION)
+                        .add(NFET.DESCRIPTION)
+                        .add(Fuse.DESCRIPTION)
+                        //.add(Diode.DESCRIPTION) // see class DiodeTest for further information
+                        .add(DiodeForward.DESCRIPTION)
+                        .add(DiodeBackward.DESCRIPTION)
+                        .add(FGPFET.DESCRIPTION)
+                        .add(FGNFET.DESCRIPTION)
+                        .add(TransGate.DESCRIPTION))
+                .add(new LibraryNode(Lang.get("lib_misc"))
+                        .add(TestCaseElement.DESCRIPTION)
+                        .add(GenericInitCode.DESCRIPTION)
+                        .add(DummyElement.RECTDESCRIPTION)
+                        .add(PowerSupply.DESCRIPTION)
+                        .add(BusSplitter.DESCRIPTION)
+                        .add(Reset.DESCRIPTION)
+                        .add(Break.DESCRIPTION)
+                        .add(Stop.DESCRIPTION)
+                        .add(AsyncSeq.DESCRIPTION)
+                        .add(External.DESCRIPTION)
+                        .add(PinControl.DESCRIPTION));
+
+        addExternalJarComponents(jarFile);
+
+        custom = new ElementLibraryFolder(root, Lang.get("menu_custom"));
+
+        File libPath = Settings.getInstance().get(Keys.SETTINGS_LIBRARY_PATH);
+        if (libPath != null && libPath.exists())
+            new ElementLibraryFolder(root, Lang.get("menu_library")).scanFolder(libPath, true);
+
+        populateNodeMap();
+
+        isProgrammable.clear();
+        root.traverse(libraryNode -> {
+            ElementTypeDescription d = libraryNode.getDescriptionOrNull();
+            if (d != null && d.hasAttribute(Keys.BLOWN))
+                isProgrammable.add(d.getName());
+        });
     }
 
-    /**
-     * Creates a new instance
-     *
-     * @param reader  the reader to parse
-     * @param srcFile the source file name if any
-     */
-    public Parser(Reader reader, String srcFile) {
-        tok = new Tokenizer(reader, srcFile);
-    }
-
-    /**
-     * If called all read references are collected.
-     */
-    public void enableRefReadCollection() {
-        refRead = new ArrayList<>();
-    }
-
-    /**
-     * @return returns the references read
-     */
-    public ArrayList<Reference> getRefsRead() {
-        return refRead;
-    }
-
-    private Statement lino(Statement statement) {
-        if (statement instanceof StatementWithLine)
-            return statement;
-        else
-            return new StatementWithLine(statement, tok.getLine());
-    }
-
-    private Expression linoE(Expression expression) {
-        if (expression instanceof ExpressionWithLine)
-            return expression;
-        else
-            return new ExpressionWithLine(expression, tok.getLine());
-    }
-
-    /**
-     * Parses the given template source
-     *
-     * @return the Statement to execute
-     * @throws IOException     IOException
-     * @throws ParserException ParserException
-     */
-    public Statement parse() throws IOException, ParserException {
-        return parse(true);
-    }
-
-    /**
-     * Parses the given template source
-     *
-     * @param startsWithText true if code starts with text.
-     * @return the Statement to execute
-     * @throws IOException     IOException
-     * @throws ParserException ParserException
-     */
-    public Statement parse(boolean startsWithText) throws IOException, ParserException {
-        Statements s = new Statements();
-        if (startsWithText) {
-            String text = tok.readText();
-            if (nextIs(SUB))
-                text = Value.trimRight(text);
-
-            if (text.length() > 0) {
-                String t = text;
-                s.add(c -> c.print(t));
+    void addExternalJarComponents(File file) {
+        if (file != null && file.getPath().length() > 0 && file.exists()) {
+            if (jarComponentManager == null)
+                jarComponentManager = new JarComponentManager(this);
+            try {
+                jarComponentManager.loadJar(file);
+            } catch (IOException | InvalidNodeException e) {
+                exception = e;
             }
         }
-        while (!nextIs(EOF))
-            s.add(parseStatement());
-
-        return s.optimize();
-    }
-
-    private Statement parseStatement() throws IOException, ParserException {
-        return parseStatement(true);
     }
 
     /**
-     * If 'isRealStatement' is false, the statement is parsed like an expression.
-     * This mode is needed to implement the 'for' loop. In a C style for loop the pre and the
-     * post code are expressions which modify state. This is not supported by HGS. In the HGS
-     * for loop the pre and the post code are statements where the semicolon at the end is omitted.
-     */
-    private Statement parseStatement(boolean isRealStatement) throws IOException, ParserException {
-        final Tokenizer.Token token = tok.next();
-        boolean export = false;
-        switch (token) {
-            case EXPORT:
-                export = true;
-                Tokenizer.Token ti = tok.next();
-                if (!ti.equals(IDENT))
-                    throw newParserException("export must be followed by an identifier!");
-            case IDENT:
-                final Reference ref = parseReference(tok.getIdent());
-                Tokenizer.Token refToken = tok.next();
-                switch (refToken) {
-                    case COLON:
-                        expect(EQUAL);
-                        final Expression initVal = parseExpression();
-                        if (isRealStatement) expect(SEMICOLON);
-                        if (export)
-                            return lino(c -> ref.exportVar(c, initVal.value(c)));
-                        else
-                            return lino(c -> ref.declareVar(c, initVal.value(c)));
-                    case EQUAL:
-                        if (export)
-                            throw newParserException("export is only allowed at variable declaration!");
-                        final Expression val = parseExpression();
-                        if (isRealStatement) expect(SEMICOLON);
-                        return lino(c -> {
-                            final Object value = val.value(c);
-                            if (value == null)
-                                throw new HGSEvalException("There is no value to assign!");
-                            ref.set(c, value);
-                        });
-                    case ADD:
-                        expect(ADD);
-                        if (export)
-                            throw newParserException("export is only allowed at variable declaration!");
-                        if (isRealStatement) expect(SEMICOLON);
-                        return lino(c -> ref.set(c, Value.toLong(ref.get(c)) + 1));
-                    case SUB:
-                        expect(SUB);
-                        if (export)
-                            throw newParserException("export is only allowed at variable declaration!");
-                        if (isRealStatement) expect(SEMICOLON);
-                        return lino(c -> ref.set(c, Value.toLong(ref.get(c)) - 1));
-                    case SEMICOLON:
-                        if (export)
-                            throw newParserException("export is only allowed at variable declaration!");
-                        return lino(ref::get);
-                    default:
-                        throw newUnexpectedToken(refToken);
-                }
-            case CODEEND:
-                String str = tok.readText();
-                if (nextIs(SUB))
-                    str = Value.trimRight(str);
-                final String strc = str;
-                return c -> c.print(strc);
-            case SUB:
-                expect(CODEEND);
-                final String strt = Value.trimLeft(tok.readText());
-                return c -> c.print(strt);
-            case EQUAL:
-                final Expression exp = parseExpression();
-                if (tok.peek() != CODEEND) expect(SEMICOLON);
-                return lino(c -> c.print(exp.value(c).toString()));
-            case IF:
-                expect(OPEN);
-                final Expression ifCond = toBool(parseExpression());
-                expect(CLOSE);
-                final Statement ifStatement = parseStatement();
-                if (nextIs(ELSE)) {
-                    final Statement elseStatement = parseStatement();
-                    return c -> {
-                        Context iC = new Context(c, false);
-                        if ((boolean) ifCond.value(iC))
-                            ifStatement.execute(iC);
-                        else
-                            elseStatement.execute(iC);
-                    };
-                } else
-                    return c -> {
-                        Context iC = new Context(c, false);
-                        if ((boolean) ifCond.value(iC))
-                            ifStatement.execute(iC);
-                    };
-            case FOR:
-                expect(OPEN);
-                Statement init = parseStatement(false); // parse like an expression
-                expect(SEMICOLON);
-                final Expression forCond = toBool(parseExpression());
-                expect(SEMICOLON);
-                Statement inc = parseStatement(false); // parse like an expression
-                expect(CLOSE);
-                Statement inner = parseStatement();
-                return c -> {
-                    Context iC = new Context(c, false);
-                    init.execute(iC);
-                    while ((boolean) forCond.value(iC)) {
-                        inner.execute(new Context(iC, false));
-                        inc.execute(iC);
-                    }
-                };
-            case WHILE:
-                expect(OPEN);
-                final Expression whileCond = toBool(parseExpression());
-                expect(CLOSE);
-                inner = parseStatement();
-                return c -> {
-                    Context iC = new Context(c, false);
-                    while ((boolean) whileCond.value(iC)) inner.execute(iC);
-                };
-            case REPEAT:
-                final Statement repeatInner = parseStatement();
-                expect(UNTIL);
-                final Expression repeatCond = toBool(parseExpression());
-                if (isRealStatement) expect(SEMICOLON);
-                return c -> {
-                    Context iC = new Context(c, false);
-                    do {
-                        repeatInner.execute(iC);
-                    } while (!(boolean) repeatCond.value(iC));
-                };
-            case OPENBRACE:
-                Statements s = new Statements();
-                while (!nextIs(CLOSEDBRACE))
-                    s.add(parseStatement());
-                return s.optimize();
-            case RETURN:
-                Expression retExp = parseExpression();
-                expect(SEMICOLON);
-                return lino(c -> FirstClassFunctionCall.returnFromFunc(retExp.value(c)));
-            case FUNC:
-                expect(IDENT);
-                String funcName = tok.getIdent();
-                FirstClassFunction funcDecl = parseFunction();
-                return lino(c -> c.declareVar(funcName, new FirstClassFunctionCall(funcDecl, c)));
-            default:
-                throw newUnexpectedToken(token);
-        }
-    }
-
-    private Expression toBool(Expression expression) {
-        return linoE(c -> Value.toBool(expression.value(c)));
-    }
-
-    private ArrayList<Expression> parseArgList() throws IOException, ParserException {
-        ArrayList<Expression> args = new ArrayList<>();
-        if (!nextIs(CLOSE)) {
-            args.add(parseExpression());
-            while (nextIs(COMMA))
-                args.add(parseExpression());
-            expect(CLOSE);
-        }
-        return args;
-    }
-
-    private Reference parseReference(String var) throws IOException, ParserException {
-        Reference r = new ReferenceToVar(var);
-        while (true) {
-            if (nextIs(OPENSQUARE)) {
-                r = new ReferenceToArray(r, parseExpression());
-                expect(CLOSEDSQUARE);
-            } else if (nextIs(OPEN)) {
-                r = new ReferenceToFunc(r, parseArgList());
-            } else if (nextIs(DOT)) {
-                expect(IDENT);
-                r = new ReferenceToStruct(r, tok.getIdent());
-            } else
-                return r;
-        }
-    }
-
-    private boolean nextIs(Tokenizer.Token t) throws IOException {
-        if (tok.peek() == t) {
-            tok.next();
-            return true;
-        }
-        return false;
-    }
-
-    private Tokenizer.Token nextIsIn(Tokenizer.Token... ts) throws IOException {
-        Tokenizer.Token next = tok.peek();
-        for (Tokenizer.Token t : ts)
-            if (next == t)
-                return tok.next();
-        return null;
-    }
-
-    private void expect(Tokenizer.Token token) throws IOException, ParserException {
-        Tokenizer.Token t = tok.next();
-        if (t != token)
-            throw newParserException("expected: " + token + ", but found: " + t);
-    }
-
-    private long convToLong(String num) throws ParserException {
-        try {
-            return Bits.decode(num);
-        } catch (Bits.NumberFormatException e) {
-            throw newParserException("not a number: " + tok.getIdent());
-        }
-    }
-
-    private double convToDouble(String num) throws ParserException {
-        try {
-            return Double.parseDouble(num);
-        } catch (NumberFormatException e) {
-            throw newParserException("not a number: " + tok.getIdent());
-        }
-    }
-
-    private ParserException newUnexpectedToken(Tokenizer.Token token) {
-        String name = token == IDENT ? tok.getIdent() : token.name();
-        return newParserException("unexpected Token: " + name);
-    }
-
-    private ParserException newParserException(String s) {
-        return new ParserException(s + " (" + tok.getSrcFile() + ":" + tok.getLine() + ")");
-    }
-
-    /**
-     * Parses a string to a simple expression
+     * registers a component source to Digital
      *
-     * @return the expression
-     * @throws IOException     IOException
-     * @throws ParserException IOException
+     * @param source the source
+     * @return this for chained calls
      */
-    public Expression parseExp() throws IOException, ParserException {
-        Expression ex = parseExpression();
-        expect(EOF);
-        return ex;
+    public ElementLibrary registerComponentSource(ComponentSource source) {
+        try {
+            if (jarComponentManager == null)
+                jarComponentManager = new JarComponentManager(this);
+            source.registerComponents(jarComponentManager);
+        } catch (InvalidNodeException e) {
+            exception = e;
+        }
+        return this;
     }
 
-    private Expression parseExpression() throws IOException, ParserException {
-        Expression a = parseOR();
-        Tokenizer.Token t = nextIsIn(LESS, LESSEQUAL, EQUAL, NOTEQUAL, GREATER, GREATEREQUAL);
-        if (t != null) {
-            Expression b = parseOR();
-            switch (t) {
-                case EQUAL:
-                    return c -> Value.equals(a.value(c), b.value(c));
-                case NOTEQUAL:
-                    return c -> !Value.equals(a.value(c), b.value(c));
-                case LESS:
-                    return c -> Value.less(a.value(c), b.value(c));
-                case LESSEQUAL:
-                    return c -> Value.lessEqual(a.value(c), b.value(c));
-                case GREATER:
-                    return c -> Value.less(b.value(c), a.value(c));
-                case GREATEREQUAL:
-                    return c -> Value.lessEqual(b.value(c), a.value(c));
-                default:
-                    throw newUnexpectedToken(t);
+    /**
+     * @return returns a exception during initialization or null if there was none
+     */
+    public Exception checkForException() {
+        Exception e = exception;
+        exception = null;
+        return e;
+    }
+
+    LibraryNode findNode(String path) throws InvalidNodeException {
+        StringTokenizer st = new StringTokenizer(path, "\\/;");
+        LibraryNode node = root;
+        while (st.hasMoreTokens()) {
+            String name = st.nextToken();
+            LibraryNode found = null;
+            for (LibraryNode n : node) {
+                if (n.getName().equals(name)) {
+                    if (n.isLeaf())
+                        throw new InvalidNodeException(Lang.get("err_Node_N_isAComponent", n));
+                    found = n;
+                }
+            }
+            if (found == null) {
+                found = new LibraryNode(name);
+                node.add(found);
+            }
+            node = found;
+        }
+        return node;
+    }
+
+    /**
+     * @return the component manager
+     */
+    public JarComponentManager getJarComponentManager() {
+        return jarComponentManager;
+    }
+
+    /**
+     * Returns true if element is programmable
+     *
+     * @param name the name
+     * @return true if it is programmable
+     */
+    public boolean isProgrammable(String name) {
+        return isProgrammable.contains(name);
+    }
+
+    /**
+     * Sets the shape factory used to import sub circuits
+     *
+     * @param shapeFactory the shape factory
+     */
+    public void setShapeFactory(ShapeFactory shapeFactory) {
+        this.shapeFactory = shapeFactory;
+    }
+
+    /**
+     * @return the shape factory
+     */
+    public ShapeFactory getShapeFactory() {
+        return shapeFactory;
+    }
+
+    /**
+     * @return the node with the custom elements
+     */
+    public LibraryNode getCustomNode() {
+        return custom.getNode();
+    }
+
+    private void populateNodeMap() {
+        map.clear();
+        final PopulateMapVisitor populateMapVisitor = new PopulateMapVisitor(map);
+        root.traverse(populateMapVisitor);
+        warningMessage = populateMapVisitor.getWarningMessage();
+    }
+
+    /**
+     * @return the warning message or null if there is none
+     */
+    public StringBuilder getWarningMessage() {
+        return warningMessage;
+    }
+
+    /**
+     * sets the root library path
+     *
+     * @param rootLibraryPath the path
+     * @throws IOException IOException
+     */
+    public void setRootFilePath(File rootLibraryPath) throws IOException {
+        if (rootLibraryPath == null) {
+            if (this.rootLibraryPath != null) {
+                this.rootLibraryPath = null;
+                rescanFolder();
+            }
+        } else if (!rootLibraryPath.equals(this.rootLibraryPath)) {
+            this.rootLibraryPath = rootLibraryPath;
+            rescanFolder();
+        }
+    }
+
+    /**
+     * @return the actual root file path
+     */
+    public File getRootFilePath() {
+        return rootLibraryPath;
+    }
+
+    /**
+     * Checks if the given file is accessible from the actual library.
+     *
+     * @param file the file to check
+     * @return true if given file is importable
+     */
+    public boolean isFileAccessible(File file) {
+        if (rootLibraryPath == null) return true;
+
+        try {
+            String root = rootLibraryPath.getCanonicalPath();
+            String path = file.getParentFile().getCanonicalPath();
+            return path.startsWith(root);
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Returns the node or null if node not present.
+     *
+     * @param elementName the name
+     * @return the node or null
+     */
+    public LibraryNode getElementNodeOrNull(String elementName) {
+        return map.get(elementName);
+    }
+
+    @Override
+    public ElementTypeDescription getElementType(String elementName, ElementAttributes attr) throws ElementNotFoundException {
+        return getElementType(elementName);
+    }
+
+    /**
+     * Returns a {@link ElementTypeDescription} by a given name.
+     * If not found its tried to load it.
+     *
+     * @param elementName the elements name
+     * @return the {@link ElementTypeDescription}
+     * @throws ElementNotFoundException ElementNotFoundException
+     */
+    public ElementTypeDescription getElementType(String elementName) throws ElementNotFoundException {
+        try {
+            LibraryNode node = map.get(elementName);
+            if (node != null)
+                return node.getDescription();
+
+            // effects only some old files!
+            elementName = elementName.replace("\\", "/");
+            if (elementName.contains("/")) {
+                elementName = new File(elementName).getName();
+            }
+
+            node = map.get(elementName);
+            if (node != null)
+                return node.getDescription();
+
+            if (rootLibraryPath == null)
+                throw new ElementNotFoundException(Lang.get("err_fileNeedsToBeSaved"));
+
+            LOGGER.debug("could not find " + elementName);
+
+            if (System.currentTimeMillis() - lastRescanTime > MIN_RESCAN_INTERVAL) {
+                rescanFolder();
+
+                node = map.get(elementName);
+                if (node != null)
+                    return node.getDescription();
+            }
+        } catch (IOException e) {
+            throw new ElementNotFoundException(Lang.get("msg_errorImportingModel_N0", elementName), e);
+        }
+
+        throw new ElementNotFoundException(Lang.get("err_element_N_notFound", elementName));
+    }
+
+    private void rescanFolder() {
+        LOGGER.debug("rescan folder");
+        LibraryNode cn = custom.scanFolder(rootLibraryPath, false);
+
+        populateNodeMap();
+
+        if (cn != null)
+            fireLibraryChanged(cn);
+        lastRescanTime = System.currentTimeMillis();
+    }
+
+    /**
+     * Fires a library event
+     *
+     * @param node the node changed
+     */
+    void fireLibraryChanged(LibraryNode node) {
+        for (LibraryListener l : listeners)
+            l.libraryChanged(node);
+    }
+
+    /**
+     * Adds a listener to this library
+     *
+     * @param listener the listener to add
+     */
+    public void addListener(LibraryListener listener) {
+        listeners.add(listener);
+        LOGGER.debug("added library listener " + listener.getClass().getSimpleName() + ", listeners: " + listeners.size());
+    }
+
+    /**
+     * Removes a listener from this library
+     *
+     * @param listener the listener to remove
+     */
+    public void removeListener(LibraryListener listener) {
+        listeners.remove(listener);
+        LOGGER.debug("removed library listener " + listener.getClass().getSimpleName() + ", listeners: " + listeners.size());
+    }
+
+
+    @Override
+    public Iterator<ElementContainer> iterator() {
+        ArrayList<ElementContainer> nodes = new ArrayList<>();
+        for (LibraryNode n : getRoot())
+            addToList(nodes, n, "");
+        return nodes.iterator();
+    }
+
+    private void addToList(ArrayList<ElementContainer> nodes, LibraryNode node, String path) {
+        if (node.isLeaf()) {
+            if (node.isDescriptionLoaded()) {
+                try {
+                    nodes.add(new ElementContainer(node.getDescription(), path));
+                } catch (IOException e) {
+                    // can not happen because description is present!
+                }
             }
         } else
-            return a;
+            for (LibraryNode n : node)
+                addToList(nodes, n, concat(path, node.getName()));
     }
 
-    private Expression parseOR() throws IOException, ParserException {
-        Expression ac = parseXOR();
-        while (nextIs(OR)) {
-            Expression a = ac;
-            Expression b = parseXOR();
-            ac = c -> Value.or(a.value(c), b.value(c));
-        }
-        return ac;
+    private String concat(String path, String name) {
+        if (path.length() == 0)
+            return name;
+        return path + " - " + name;
+
     }
 
-    private Expression parseXOR() throws IOException, ParserException {
-        Expression ac = parseAND();
-        while (nextIs(XOR)) {
-            Expression a = ac;
-            Expression b = parseAND();
-            ac = c -> Value.xor(a.value(c), b.value(c));
-        }
-        return ac;
-    }
-
-    private Expression parseAND() throws IOException, ParserException {
-        Expression ac = parseShiftRight();
-        while (nextIs(AND)) {
-            Expression a = ac;
-            Expression b = parseShiftRight();
-            ac = c -> Value.and(a.value(c), b.value(c));
-        }
-        return ac;
-    }
-
-    private Expression parseShiftRight() throws IOException, ParserException {
-        Expression ac = parseShiftLeft();
-        while (nextIs(SHIFTRIGHT)) {
-            Expression a = ac;
-            Expression b = parseShiftLeft();
-            ac = c -> Value.toLong(a.value(c)) >>> Value.toLong(b.value(c));
-        }
-        return ac;
-    }
-
-    private Expression parseShiftLeft() throws IOException, ParserException {
-        Expression ac = parseAdd();
-        while (nextIs(SHIFTLEFT)) {
-            Expression a = ac;
-            Expression b = parseAdd();
-            ac = c -> Value.toLong(a.value(c)) << Value.toLong(b.value(c));
-        }
-        return ac;
-    }
-
-    private Expression parseAdd() throws IOException, ParserException {
-        Expression ac = parseSub();
-        while (nextIs(ADD)) {
-            Expression a = ac;
-            Expression b = parseSub();
-            ac = c -> Value.add(a.value(c), b.value(c));
-        }
-        return ac;
-    }
-
-    private Expression parseSub() throws IOException, ParserException {
-        Expression ac = parseMul();
-        while (nextIs(SUB)) {
-            Expression a = ac;
-            Expression b = parseMul();
-            ac = c -> Value.sub(a.value(c), b.value(c));
-        }
-        return ac;
-    }
-
-    private Expression parseMul() throws IOException, ParserException {
-        Expression ac = parseDiv();
-        while (nextIs(MUL)) {
-            Expression a = ac;
-            Expression b = parseDiv();
-            ac = c -> Value.mul(a.value(c), b.value(c));
-        }
-        return ac;
-    }
-
-    private Expression parseDiv() throws IOException, ParserException {
-        Expression ac = parseMod();
-        while (nextIs(DIV)) {
-            Expression a = ac;
-            Expression b = parseMod();
-            ac = c -> Value.div(a.value(c), b.value(c));
-        }
-        return ac;
-    }
-
-    private Expression parseMod() throws IOException, ParserException {
-        Expression ac = parseIdent();
-        while (nextIs(MOD)) {
-            Expression a = ac;
-            Expression b = parseIdent();
-            ac = c -> Value.toLong(a.value(c)) % Value.toLong(b.value(c));
-        }
-        return ac;
-    }
-
-    private Expression parseIdent() throws IOException, ParserException {
-        Tokenizer.Token t = tok.next();
-        switch (t) {
-            case IDENT:
-                String name = tok.getIdent();
-                Reference r = parseReference(name);
-                if (refRead != null)
-                    refRead.add(r);
-                return r::get;
-            case NUMBER:
-                long num = convToLong(tok.getIdent());
-                return c -> num;
-            case DOUBLE:
-                double d = convToDouble(tok.getIdent());
-                return c -> d;
-            case TRUE:
-                return c -> true;
-            case FALSE:
-                return c -> false;
-            case STRING:
-                String s = tok.getIdent();
-                return c -> s;
-            case SUB:
-                Expression negExp = parseIdent();
-                return c -> Value.neg(negExp.value(c));
-            case NOT:
-                Expression notExp = parseIdent();
-                return c -> Value.not(notExp.value(c));
-            case OPEN:
-                Expression exp = parseExpression();
-                expect(CLOSE);
-                return exp;
-            case OPENBRACE:
-                return parseStructLiteral();
-            case FUNC:
-                FirstClassFunction func = parseFunction();
-                return c -> new FirstClassFunctionCall(func, c);
-            default:
-                throw newUnexpectedToken(t);
+    /**
+     * Removes an element from the library to enforce a reload
+     *
+     * @param name the elements name
+     * @throws IOException IOException
+     */
+    public void invalidateElement(File name) throws IOException {
+        LibraryNode n = map.get(name.getName());
+        if (n != null)
+            n.invalidate();
+        else {
+            if (rootLibraryPath != null && isFileAccessible(name))
+                rescanFolder();
         }
     }
 
-    private Expression parseStructLiteral() throws IOException, ParserException {
-        StructLiteral sl = new StructLiteral();
-        while (true) {
-            Tokenizer.Token t = tok.next();
-            switch (t) {
-                case CLOSEDBRACE:
-                    return sl;
-                case IDENT:
-                    String key = tok.getIdent();
-                    expect(COLON);
-                    Expression exp = parseExpression();
-                    sl.add(key, exp);
-                    if (nextIs(COMMA))
-                        tok.consume();
+    /**
+     * Updates all entries
+     *
+     * @throws IOException IOException
+     */
+    public void updateEntries() throws IOException {
+        rescanFolder();
+    }
+
+    /**
+     * @return the root element
+     */
+    public LibraryNode getRoot() {
+        return root;
+    }
+
+    /**
+     * Imports the given file
+     *
+     * @param file the file to load
+     * @return the description
+     * @throws IOException IOException
+     */
+    ElementTypeDescription importElement(File file) throws IOException {
+        try {
+            LOGGER.debug("load element " + file);
+            Circuit circuit;
+            try {
+                circuit = Circuit.loadCircuit(file, shapeFactory);
+            } catch (FileNotFoundException e) {
+                throw new IOException(Lang.get("err_couldNotFindIncludedFile_N0", file));
+            }
+
+            ElementTypeDescriptionCustom description = createCustomDescription(file, circuit, this);
+            description.setShortName(createShortName(file.getName(), circuit.getAttributes().getLabel()));
+
+            String descriptionText = Lang.evalMultilingualContent(circuit.getAttributes().get(Keys.DESCRIPTION));
+            if (descriptionText != null && descriptionText.length() > 0) {
+                description.setDescription(descriptionText);
+            }
+            return description;
+        } catch (PinException e) {
+            throw new IOException(Lang.get("msg_errorImportingModel_N0", file), e);
+        }
+    }
+
+    private String createShortName(String name, String userDefined) {
+        if (userDefined.isEmpty()) {
+            if (name.endsWith(".dig")) return name.substring(0, name.length() - 4).replace("_", "\\_");
+
+            String transName = Lang.getNull("elem_" + name);
+            if (transName == null)
+                return name;
+            else
+                return transName;
+        } else {
+            return userDefined;
+        }
+    }
+
+    /**
+     * Creates a custom element description.
+     *
+     * @param file    the file
+     * @param circuit the circuit
+     * @param library the used library
+     * @return the type description
+     * @throws PinException PinException
+     */
+    public static ElementTypeDescriptionCustom createCustomDescription(File file, Circuit circuit, ElementLibrary library) throws PinException {
+        ElementTypeDescriptionCustom d = new ElementTypeDescriptionCustom(file, circuit);
+        d.setElementFactory(attributes -> new CustomElement(d));
+        return d;
+    }
+
+
+    /**
+     * Used to store a elements name and its position in the elements menu.
+     */
+    public static class ElementContainer {
+        private final ElementTypeDescription name;
+        private final String treePath;
+
+        /**
+         * Creates anew instance
+         *
+         * @param typeDescription the elements typeDescription
+         * @param treePath        the elements menu path
+         */
+        ElementContainer(ElementTypeDescription typeDescription, String treePath) {
+            this.name = typeDescription;
+            this.treePath = treePath;
+        }
+
+        /**
+         * @return the elements name
+         */
+        public ElementTypeDescription getDescription() {
+            return name;
+        }
+
+        /**
+         * @return Returns the path in the menu
+         */
+        public String getTreePath() {
+            return treePath;
+        }
+    }
+
+    private static final class PopulateMapVisitor implements Visitor {
+        private static final int MAX_WARNING_ENTRIES = 15;
+        private final HashMap<String, LibraryNode> map;
+        private StringBuilder warningMessage;
+        private int warningEntries = 0;
+
+        private PopulateMapVisitor(HashMap<String, LibraryNode> map) {
+            this.map = map;
+        }
+
+        @Override
+        public void visit(LibraryNode libraryNode) {
+            if (libraryNode.isLeaf()) {
+                final String name = libraryNode.getName();
+
+                LibraryNode presentNode = map.get(name);
+                if (presentNode == null) {
+                    map.put(name, libraryNode);
+                    libraryNode.setUnique(true);
+                } else {
+                    if (presentNode.equalsFile(libraryNode))
+                        libraryNode.setUnique(true);
                     else {
-                        if (tok.peek() != CLOSEDBRACE)
-                            throw newUnexpectedToken(t);
+                        presentNode.setUnique(false); // ToDo does not work if there are more than two duplicates and
+                        libraryNode.setUnique(false); // some of the duplicates point to the same file
+                        if (warningMessage == null)
+                            warningMessage = new StringBuilder(Lang.get("msg_duplicateLibraryFiles"));
+                        if (warningEntries <= MAX_WARNING_ENTRIES)
+                            warningMessage.append("\n\n").append(presentNode.getFile()).append("\n").append(libraryNode.getFile());
+                        warningEntries++;
                     }
-                    break;
-                default:
-                    throw newUnexpectedToken(t);
+                }
             }
         }
-    }
 
-    private FirstClassFunction parseFunction() throws IOException, ParserException {
-        expect(OPEN);
-        ArrayList<String> args = new ArrayList<>();
-        if (!nextIs(CLOSE)) {
-            expect(IDENT);
-            args.add(tok.getIdent());
-            while (!nextIs(CLOSE)) {
-                expect(COMMA);
-                expect(IDENT);
-                args.add(tok.getIdent());
+        private StringBuilder getWarningMessage() {
+            if (warningEntries >= MAX_WARNING_ENTRIES) {
+                warningMessage.append("\n\n").append(Lang.get("msg_and_N_More", warningEntries - MAX_WARNING_ENTRIES));
+                warningEntries = 0;
             }
+            return warningMessage;
         }
-        Statement st = parseStatement();
-        return new FirstClassFunction(args, st);
-    }
-
-    private static final class StatementWithLine implements Statement {
-        private final Statement statement;
-        private final int line;
-
-        private StatementWithLine(Statement statement, int line) {
-            this.statement = statement;
-            this.line = line;
-        }
-
-        @Override
-        public void execute(Context context) throws HGSEvalException {
-            try {
-                statement.execute(context);
-            } catch (HGSEvalException e) {
-                e.setLinNum(line);
-                throw e;
-            }
-        }
-    }
-
-    private static final class ExpressionWithLine implements Expression {
-        private final Expression expression;
-        private final int line;
-
-        private ExpressionWithLine(Expression expression, int line) {
-            this.expression = expression;
-            this.line = line;
-        }
-
-        @Override
-        public Object value(Context c) throws HGSEvalException {
-            try {
-                return expression.value(c);
-            } catch (HGSEvalException e) {
-                e.setLinNum(line);
-                throw e;
-            }
-        }
-    }
-
-    private static final class StructLiteral implements Expression {
-        private final HashMap<String, Expression> map;
-
-        private StructLiteral() {
-            map = new HashMap<>();
-        }
-
-        private void add(String key, Expression exp) {
-            map.put(key, exp);
-        }
-
-        @Override
-        public Object value(Context c) throws HGSEvalException {
-            HashMap<String, Object> vmap = new HashMap<>();
-            for (Map.Entry<String, Expression> e : map.entrySet())
-                vmap.put(e.getKey(), e.getValue().value(c));
-            return vmap;
-        }
-
     }
 }
